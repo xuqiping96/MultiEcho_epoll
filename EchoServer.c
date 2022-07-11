@@ -1,11 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <sys/socket.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
-#include <pthread.h>
 #include <errno.h>
 
 #define BUF_SIZE 1024
@@ -13,6 +11,7 @@
 #define PORT 10000
 #define MAX_CLNT 5
 #define NAME_LEN 10
+#define EPOLL_SIZE 50
 
 int listen_sock, conn_sock;
 struct sockaddr_in serv_adr;
@@ -25,10 +24,10 @@ typedef struct {
     FILE *write_fp;
 } ClntInfo;
 
-struct pollfd clnts[FOPEN_MAX];
-ClntInfo clnts_info[FOPEN_MAX];
-int maxi;
-int nready;
+ClntInfo clnts_info[EPOLL_SIZE];
+struct epoll_event *ep_events;
+struct epoll_event event;
+int epfd, event_cnt;
 
 ////////////////////函数声明////////////////////
 /**
@@ -59,7 +58,7 @@ void add_clnt_sock(int clnt_sock);
  * @brief 将客户端从数组中移除，并关闭文件指针
  * 
  */
-void remove_clnt_sock(int index);
+void remove_clnt_sock(int clnt_sock, int index);
 
 /**
  * @brief 向除了当前客户端以外的其他客户端发送消息
@@ -78,7 +77,7 @@ int is_saying_bye(char *message);
  * @brief 客户端读写的执行函数
  * 
  */
-void clnt_handler(int index);
+void clnt_handler(int clnt_sock, int index);
 
 ////////////////////函数定义////////////////////
 void error_handler(char *error_msg)
@@ -109,58 +108,45 @@ void server_addr_init(struct sockaddr_in *serv_adr, char *addr, int port, int se
 
 void clnt_array_init()
 {
-    clnts[0].fd = listen_sock;
-    clnts[0].events = POLLRDNORM;
+    epfd = epoll_create(EPOLL_SIZE);
+    ep_events = (struct epoll_event *)malloc(sizeof(struct epoll_event) * EPOLL_SIZE);
 
-    for(int i = 1; i < FOPEN_MAX; i++)
+    event.events = EPOLLIN;
+    event.data.fd = listen_sock;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &event);
+    
+    for(int i = 0; i < EPOLL_SIZE; i++)
     {
-        clnts[i].fd = -1;
         clnts_info[i].name = NULL;
     }
-
-    maxi = 0;
 }
 
 void add_clnt_sock(int clnt_sock)
 {
-    int i;
+    event.events = EPOLLIN;
+    event.data.fd = clnt_sock;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, clnt_sock, &event);
 
-    for(i = 1; i < FOPEN_MAX  ; i++)
-    {
-        if(clnts[i].fd < 0)
-        {
-            clnts[i].fd = clnt_sock;
-            clnts_info[i].read_fp = fdopen(clnt_sock, "r");
-            clnts_info[i].write_fp = fdopen(clnt_sock, "w");
-
-            break;
-        }
-    }
-
-    clnts[i].events = POLLRDNORM;
-
-    if(i > maxi)
-    {
-        maxi = i;
-    }
+    clnts_info[clnt_sock].read_fp = fdopen(clnt_sock, "r");
+    clnts_info[clnt_sock].write_fp = fdopen(clnt_sock, "w");
 }
 
-void remove_clnt_sock(int index)
+void remove_clnt_sock(int clnt_sock, int index)
 {
-    fclose(clnts_info[index].read_fp);
-    fclose(clnts_info[index].write_fp);
+    fclose(clnts_info[clnt_sock].read_fp);
+    fclose(clnts_info[clnt_sock].write_fp);
 
-    free(clnts_info[index].name);
-    clnts_info[index].name = NULL;
+    free(clnts_info[clnt_sock].name);
+    clnts_info[clnt_sock].name = NULL;
 
-    clnts[index].fd = -1;
+    epoll_ctl(epfd, EPOLL_CTL_DEL, ep_events[index].data.fd, NULL);
 }
 
 void send_message_to_clnts(char *message, int clnt_sock)
 {
-    for(int i = 1; i < FOPEN_MAX; i++)
+    for(int i = 1; i < EPOLL_SIZE; i++)
     {
-        if(clnts[i].fd > 0 && clnts[i].fd != clnt_sock)
+        if(clnts_info[i].name != NULL && i != clnt_sock)
         {
             fputs(message, clnts_info[i].write_fp);
             fflush(clnts_info[i].write_fp);
@@ -179,33 +165,33 @@ int is_saying_bye(char *message)
     }
 }
 
-void clnt_handler(int index)
+void clnt_handler(int clnt_sock, int index)
 {
     char read_message[BUF_SIZE];
     char send_message[BUF_SIZE];
     char *name;
 
     //从客户端获得消息并发送给其他客户端
-    fgets(read_message, BUF_SIZE, clnts_info[index].read_fp);
-    if(clnts_info[index].name == NULL)
+    fgets(read_message, BUF_SIZE, clnts_info[clnt_sock].read_fp);
+    if(clnts_info[clnt_sock].name == NULL)
     {
         name = strtok(read_message, "\n");
-        clnts_info[index].name = (char *)calloc(NAME_LEN + 1, sizeof(char));
-        strcpy(clnts_info[index].name, name);
+        clnts_info[clnt_sock].name = (char *)calloc(NAME_LEN + 1, sizeof(char));
+        strcpy(clnts_info[clnt_sock].name, name);
 
-        snprintf(send_message ,BUF_SIZE, "%s has joind\n", clnts_info[index].name);
+        snprintf(send_message ,BUF_SIZE, "%s has joind\n", clnts_info[clnt_sock].name);
     } else
     {
-        snprintf(send_message, BUF_SIZE, "Message from %s: %s", clnts_info[index].name, read_message);
+        snprintf(send_message, BUF_SIZE, "Message from %s: %s", clnts_info[clnt_sock].name, read_message);
     }
     
     printf("%s", send_message);
-    send_message_to_clnts(send_message, clnts[index].fd);
+    send_message_to_clnts(send_message, clnt_sock);
 
     if(is_saying_bye(read_message))
     {
         printf("Closing down connection ...\n");
-        remove_clnt_sock(index);
+        remove_clnt_sock(clnt_sock, index);
     }
 }
 
@@ -236,43 +222,26 @@ int main(int argc, char *argv[])
     printf("Listening for connection ...\n");
     while(1)
     {
-        nready = poll(clnts, maxi + 1, -1);
+        event_cnt = epoll_wait(epfd, ep_events, EPOLL_SIZE, -1);
 
-        if(nready == -1)
+        if(event_cnt == -1)
         {
-            error_handler("poll()");
-        }
-        
-        if(clnts[0].revents & POLLRDNORM)
-        {
-            conn_sock = accept(listen_sock, (struct sockaddr *)&clnt_adr, &clnt_adr_sz);
-            printf("New client accepted\n");
-            add_clnt_sock(conn_sock);
-            printf("Connection successful\n");
-            printf("Listening for input ...\n");
-            printf("Listening for connection ...\n");
-
-            if(--nready <= 0)
-            {
-                continue;
-            }
+            error_handler("epoll()");
         }
 
-        for(int i = 1; i <= maxi; i++)
+        for(int i = 0; i < event_cnt; i++)
         {
-            if(clnts[i].fd < 0)
+            if(ep_events[i].data.fd == listen_sock)
             {
-                continue;
-            }
-
-            if(clnts[i].revents & POLLRDNORM)
+                conn_sock = accept(listen_sock, (struct sockaddr *)&clnt_adr, &clnt_adr_sz);
+                printf("New client accepted\n");
+                add_clnt_sock(conn_sock);
+                printf("Connection successful\n");
+                printf("Listening for input ...\n");
+                printf("Listening for connection ...\n");
+            } else
             {
-                clnt_handler(i);
-                
-                if(--nready <= 0)
-                {
-                    break;
-                }
+                clnt_handler(ep_events[i].data.fd, i);
             }
         }
     }
